@@ -39,6 +39,7 @@ import java.util.stream.Collectors;
 import javax.annotation.Nullable;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Throwables;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
@@ -50,7 +51,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.concurrent.ScheduledExecutors;
+import org.apache.cassandra.config.Config;
+import org.apache.cassandra.config.ConfigurationLoader;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.YamlConfigurationLoader;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Directories;
 import org.apache.cassandra.db.Keyspace;
@@ -58,7 +62,6 @@ import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.db.compaction.CompactionStrategyManager;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
-import org.apache.cassandra.gms.*;
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.locator.RangesAtEndpoint;
@@ -154,7 +157,7 @@ import static org.apache.cassandra.utils.FBUtilities.getBroadcastAddressAndPort;
  * (via {@link org.apache.cassandra.net.MessagingService}, while the actual files themselves are sent by a special
  * "streaming" connection type. See {@link StreamingMultiplexedChannel} for details. Because of the asynchronous
  */
-public class StreamSession implements IEndpointStateChangeSubscriber
+public class StreamSession
 {
     private static final Logger logger = LoggerFactory.getLogger(StreamSession.class);
 
@@ -200,6 +203,8 @@ public class StreamSession implements IEndpointStateChangeSubscriber
 
     private final TimeUUID pendingRepair;
     private final PreviewKind previewKind;
+
+    public String failurereasons;
 
 /**
  * State Transition:
@@ -512,13 +517,20 @@ public class StreamSession implements IEndpointStateChangeSubscriber
         }
     }
 
-    private synchronized Future<?> closeSession(State finalState)
+    private Future<?> closeSession(State finalState)
+    {
+        return closeSession(finalState, null);
+    }
+
+    private synchronized Future<?> closeSession(State finalState, String reason)
     {
         // it's session is already closed
         if (closeFuture != null)
             return closeFuture;
 
         state(finalState);
+        //this refers to StreamInfo
+        this.failurereasons = reason;
 
         List<Future<?>> futures = new ArrayList<>();
 
@@ -671,7 +683,6 @@ public class StreamSession implements IEndpointStateChangeSubscriber
             if (state.finalState)
             {
                 logger.debug("[Stream #{}] Socket closed after session completed with state {}", planId(), state);
-
                 return null;
             }
             else
@@ -680,8 +691,7 @@ public class StreamSession implements IEndpointStateChangeSubscriber
                              planId(),
                              peer.getHostAddressAndPort(),
                              e);
-
-                return closeSession(State.FAILED);
+                return closeSession(State.FAILED, " Failed because there was an " + e.getClass().getCanonicalName() + " with state=" + state.name());
             }
         }
 
@@ -692,8 +702,7 @@ public class StreamSession implements IEndpointStateChangeSubscriber
             state(State.FAILED); // make sure subsequent error handling sees the session in a final state 
             channel.sendControlMessage(new SessionFailedMessage()).awaitUninterruptibly();
         }
-
-        return closeSession(State.FAILED);
+        return closeSession(State.FAILED, "Failed because of an unkown exception;\n" + Throwables.getStackTraceAsString(e));
     }
 
     private void logError(Throwable e)
@@ -979,7 +988,7 @@ public class StreamSession implements IEndpointStateChangeSubscriber
         StreamTransferTask task = transfers.get(message.header.tableId);
         if (task != null)
         {
-            task.scheduleTimeout(message.header.sequenceNumber, 12, TimeUnit.HOURS);
+            task.scheduleTimeout(message.header.sequenceNumber, DatabaseDescriptor.timeoutDelay(), TimeUnit.MILLISECONDS);
         }
     }
 
@@ -1101,7 +1110,7 @@ public class StreamSession implements IEndpointStateChangeSubscriber
     public synchronized void sessionFailed()
     {
         logger.error("[Stream #{}] Remote peer {} failed stream session.", planId(), peer.toString());
-        closeSession(State.FAILED);
+        closeSession(State.FAILED," Remote peer " + peer + " failed stream session");
     }
 
     /**
@@ -1110,7 +1119,7 @@ public class StreamSession implements IEndpointStateChangeSubscriber
     public synchronized void sessionTimeout()
     {
         logger.error("[Stream #{}] timeout with {}.", planId(), peer.toString());
-        closeSession(State.FAILED);
+        closeSession(State.FAILED, " Failed because the session timed out");
     }
 
     /**
@@ -1124,7 +1133,7 @@ public class StreamSession implements IEndpointStateChangeSubscriber
         List<StreamSummary> transferSummaries = Lists.newArrayList();
         for (StreamTask transfer : transfers.values())
             transferSummaries.add(transfer.getSummary());
-        return new SessionInfo(channel.peer(), index, channel.connectedTo(), receivingSummaries, transferSummaries, state);
+        return new SessionInfo(channel.peer(), index, channel.connectedTo(), receivingSummaries, transferSummaries, state, failurereasons);
     }
 
     public synchronized void taskCompleted(StreamReceiveTask completedTask)
@@ -1137,18 +1146,6 @@ public class StreamSession implements IEndpointStateChangeSubscriber
     {
         transfers.remove(completedTask.tableId);
         maybeCompleted();
-    }
-
-    public void onRemove(InetAddressAndPort endpoint)
-    {
-        logger.error("[Stream #{}] Session failed because remote peer {} has left.", planId(), peer.toString());
-        closeSession(State.FAILED);
-    }
-
-    public void onRestart(InetAddressAndPort endpoint, EndpointState epState)
-    {
-        logger.error("[Stream #{}] Session failed because remote peer {} was restarted.", planId(), peer.toString());
-        closeSession(State.FAILED);
     }
 
     private void completePreview()
